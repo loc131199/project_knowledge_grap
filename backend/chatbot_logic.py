@@ -288,6 +288,19 @@ class ChatbotLogic:
         self.language_and_certificate_mapping["chuẩn năng lực ngoại ngữ"] = "KhungNangLucNgoaiNguVietNam"
         self.language_and_certificate_mapping["khung năng lực ngoại ngữ"] = "KhungNangLucNgoaiNguVietNam"
 
+    def _extract_target_course_name(self, lower_question: str) -> str | None:
+        """
+        Tìm tên học phần mục tiêu (target) trong câu hỏi.
+        Ví dụ: "... liên quan như thế nào đến môn Công nghệ phần mềm?"
+        """
+        # Tìm cụm "môn", "học phần" + tên
+        triggers = ["đến môn", "đến học phần", "với môn", "với học phần"]
+        for t in triggers:
+            if t in lower_question:
+                after = lower_question.split(t, 1)[1].strip(" ?.")
+                return after.title()  # viết hoa chuẩn
+        return None
+
     def _extract_program_name(self, lower_question: str) -> str | None:
         cleaned_question = lower_question.strip().lower()
 
@@ -505,6 +518,7 @@ class ChatbotLogic:
         context = []
         lower_question = user_question.lower()
 
+        found_target_course_name = self._extract_target_course_name(lower_question)
         found_program_name = self._extract_program_name(lower_question)
         found_semester_name = self._extract_semester_name(lower_question)
         found_course_name = self._extract_course_name(lower_question)
@@ -520,6 +534,133 @@ class ChatbotLogic:
         ]
         
         # --- Xử lý các câu hỏi liên quan đến Ngoại ngữ và Chứng chỉ (Ưu tiên cao hơn) ---
+        # TRƯỜNG HỢP 17: Trong CTĐT A, học phần B liên quan tới những đồ án nào, tiên quyết hoặc song hành nào, 
+        # và các học phần đó liên quan thế nào tới học phần C.
+        # ================= TRƯỜNG HỢP 17 =================
+        # Trong chương trình đào tạo A, học phần B liên quan đến đồ án,
+        # tiên quyết, song hành, và các học phần đó liên quan thế nào đến C.
+        if (
+            found_program_name
+            and found_course_name
+            and (found_target_course_name := self._extract_target_course_name(lower_question))
+            and any(
+                kw in lower_question
+                for kw in [
+                    "liên quan đến những đồ án",
+                    "liên quan đến đồ án",
+                    "tiên quyết hoặc song hành",
+                    "liên quan như thế nào đến",
+                ]
+            )
+        ):
+            query = f"""
+            MATCH (ct:ChuongTrinhDaoTao {{ten_chuong_trinh: '{found_program_name}'}})
+            MATCH (hp)-[:THUOC]->(ct)
+            WHERE hp.ten_mon = '{found_course_name}'
+
+            // --- tất cả các PBL trong CTĐT
+            OPTIONAL MATCH (pbl_in_prog)-[:THUOC]->(ct)
+            WHERE pbl_in_prog.ten_mon STARTS WITH 'PBL'
+
+            // --- PBL liên kết trực tiếp với hp
+            OPTIONAL MATCH (pbl_direct)-[:THUOC]->(ct)
+            WHERE pbl_direct.ten_mon STARTS WITH 'PBL'
+            AND (
+                (pbl_direct)-[:LA_HOC_PHAN_SONG_HANH_VOI]-(hp)
+                OR (pbl_direct)-[:LA_HOC_PHAN_TIEN_QUYET_CUA]->(hp)
+                OR (hp)-[:LA_HOC_PHAN_TIEN_QUYET_CUA]->(pbl_direct)
+            )
+
+            // --- tiên quyết của hp trong CTĐT
+            OPTIONAL MATCH (prereq)-[:THUOC]->(ct)
+            WHERE (prereq)-[:LA_HOC_PHAN_TIEN_QUYET_CUA]->(hp)
+
+            // --- song hành của hp trong CTĐT
+            OPTIONAL MATCH (co)-[:THUOC]->(ct)
+            WHERE (co)-[:LA_HOC_PHAN_SONG_HANH_VOI]-(hp)
+
+            // --- quan hệ với môn target
+            OPTIONAL MATCH (target {{ten_mon: '{found_target_course_name}'}})
+            OPTIONAL MATCH (pbl_direct)-[r1]->(target)
+            OPTIONAL MATCH (prereq)-[r2]->(target)
+            OPTIONAL MATCH (co)-[r3]->(target)
+
+            RETURN
+            hp.ten_mon AS HocPhan,
+            ct.ten_chuong_trinh AS ChuongTrinh,
+            collect(DISTINCT pbl_in_prog.ten_mon) AS DoAn,
+            collect(DISTINCT pbl_direct.ten_mon) AS DoAn_LienQuan_TrucTiep,
+            collect(DISTINCT prereq.ten_mon) AS HocPhan_TienQuyet,
+            collect(DISTINCT co.ten_mon) AS HocPhan_SongHanh,
+            collect(DISTINCT type(r1)) AS QuanHe_DoAn_Voi_Target,
+            collect(DISTINCT type(r2)) AS QuanHe_TienQuyet_Voi_Target,
+            collect(DISTINCT type(r3)) AS QuanHe_SongHanh_Voi_Target
+            """
+
+            results = self.neo4j_handler.execute_query(query)
+
+            if results:
+                record = results[0]
+                context.append(
+                    f"Trong chương trình **{record['ChuongTrinh']}**, học phần **{record['HocPhan']}** "
+                    f"có liên quan đến các đồ án: {', '.join([x for x in record['DoAn'] if x]) or 'Không có'}.\n\n"
+                    f"- Đồ án liên quan trực tiếp: {', '.join([x for x in record['DoAn_LienQuan_TrucTiep'] if x]) or 'Không có'}\n"
+                    f"- Học phần tiên quyết: {', '.join([x for x in record['HocPhan_TienQuyet'] if x]) or 'Không có'}\n"
+                    f"- Học phần song hành: {', '.join([x for x in record['HocPhan_SongHanh'] if x]) or 'Không có'}\n\n"
+                    f"Liên quan đến học phần **{found_target_course_name}** như sau:\n"
+                    f"- Quan hệ Đồ án → {found_target_course_name}: {', '.join([x for x in record['QuanHe_DoAn_Voi_Target'] if x]) or 'Không có'}\n"
+                    f"- Quan hệ Tiên quyết → {found_target_course_name}: {', '.join([x for x in record['QuanHe_TienQuyet_Voi_Target'] if x]) or 'Không có'}\n"
+                    f"- Quan hệ Song hành → {found_target_course_name}: {', '.join([x for x in record['QuanHe_SongHanh_Voi_Target'] if x]) or 'Không có'}"
+                )
+                return "\n".join(context)
+            else:
+                return (
+                    f"Không tìm thấy thông tin về học phần **{found_course_name}** trong chương trình "
+                    f"**{found_program_name}** và mối liên hệ với **{found_target_course_name}**."
+                )
+        # TRƯỜNG HỢP 17: Nếu trượt môn B thì không được học những môn nào trong CTĐT A
+        if found_course_name and found_program_name and any(
+            kw in lower_question for kw in ["nếu tôi trượt", "nếu rớt", "không qua môn"]
+        ):
+            query = f"""
+            MATCH (ct:ChuongTrinhDaoTao {{ten_chuong_trinh: '{found_program_name}'}})
+            MATCH (hp {{ten_mon: '{found_course_name}'}})-[:THUOC]->(ct)
+
+            MATCH (blocked)-[:THUOC]->(ct)
+            WHERE (blocked)<-[:LA_HOC_PHAN_TIEN_QUYET_CUA*]-(hp)
+
+            OPTIONAL MATCH (related)-[:THUOC]->(ct)
+            WHERE (blocked)-[:LA_HOC_PHAN_TIEN_QUYET_CUA*]->(related)
+
+            RETURN DISTINCT
+                ct.ten_chuong_trinh AS ChuongTrinhDaoTao,
+                collect(DISTINCT blocked.ten_mon) AS HocPhan_Bi_Chan,
+                collect(DISTINCT related.ten_mon) AS AnhHuong_Den_HocPhan
+            """
+
+            results = self.neo4j_handler.execute_query(query)
+            if results:
+                lines = [
+                    f"Nếu bạn **trượt môn {found_course_name}** trong chương trình **{found_program_name}**, thì:"
+                ]
+                for r in results:
+                    bi_chan = r.get("HocPhan_Bi_Chan") or []
+                    anh_huong = r.get("AnhHuong_Den_HocPhan") or []
+
+                    if bi_chan:
+                        lines.append(f"- Bạn **không thể học** các học phần: {', '.join(bi_chan)}")
+                    if anh_huong:
+                        lines.append(f"- Kéo theo đó bạn **không thể học thêm** các học phần: {', '.join(anh_huong)}")
+
+                context.append("\n".join(lines))
+            else:
+                context.append(
+                    f"Không tìm thấy thông tin về ảnh hưởng khi trượt môn **{found_course_name}** trong chương trình **{found_program_name}**."
+                )
+
+            return "\n".join(context)
+
+
         # TRƯỜNG HỢP 1: Chuẩn năng lực ngoại ngữ là gì? / Khung năng lực ngoại ngữ là gì?
         if "chuẩn năng lực ngoại ngữ là gì" in lower_question or \
         "khung năng lực ngoại ngữ việt nam là gì" in lower_question or \
@@ -1152,7 +1293,8 @@ class ChatbotLogic:
                 return formatted_context
             else:
                 return f"Không tìm thấy thông tin về học phần **{found_course_name}** trong chương trình **{found_program_name}**."
-                
+
+       
         # TRƯỜNG HỢP FALLBACK: Câu hỏi không nằm trong các quy tắc đã định
         else:
             # Trả về một chuỗi rỗng hoặc None để báo hiệu không tìm thấy context
